@@ -37,6 +37,10 @@ Features
 * Automatic telegram configuration reload (no need for restarts once per day)
 * IPv6 for client connections
 * All configuration options can be updated without service restart
+* Split-mode setup: run the client-facing part (front) on a domestic server and
+  the Telegram-facing part (back) on a foreign server, connected via Erlang distribution
+  (TLS or a censorship-resistant tunnel). Bypasses ISP blocks that target direct
+  domestic→foreign connections. Multiple front servers can share one back server.
 * Small codebase compared to official one, code is covered by automated tests
 * A lots of metrics could be exported (optional)
 
@@ -810,3 +814,158 @@ Number of connections
 ```bash
 /opt/mtp_proxy/bin/mtp_proxy eval 'lists:sum([maps:get(all_connections, L) || {_, L} <- maps:to_list(ranch:info())]).'
 ```
+
+Split-mode setup (front + back)
+--------------------------------
+
+### Why split mode?
+
+Some censors (e.g. Roskomnadzor) monitor connections from domestic IPs to foreign
+servers more aggressively than domestic-to-domestic traffic. A common workaround is
+to split the proxy across two servers:
+
+- **Front server** — domestic (or neutral) IP, accepts Telegram client connections.
+- **Back server** — foreign IP, connects to Telegram data centres.
+
+```
+Telegram client
+      │
+      ▼ (443 / any port)
+ ┌────────────┐
+ │ front node │  domestic server  (mtp_handler, session storage, policies)
+ └─────┬──────┘
+       │  inter-server link (VPN or TLS)
+       ▼
+ ┌────────────┐
+ │ back node  │  foreign server   (DC pool connections to Telegram)
+ └─────┬──────┘
+       │  TCP to Telegram
+       ▼
+  Telegram DC
+```
+
+Multiple front servers can share one back server — just set the same `back_node`
+address in each front's config.  The DC pools on the back multiplex all client
+connections regardless of which front they came from.
+
+### Prerequisites
+
+- Erlang/OTP 25+ installed on **both** servers (same version recommended).
+- Both servers can reach each other over TCP (the inter-server port, see below).
+- The back server has outbound TCP access to Telegram's infrastructure (ports
+  are announced dynamically in [Telegram's proxy config](https://core.telegram.org/getProxyConfig).
+
+### Step 1 — secure the inter-server link
+
+The two servers communicate using Erlang's built-in distribution protocol, which
+allows full remote control of the process.  **You must restrict access to this
+channel** to the two proxy servers only.  There are two ways to do this:
+
+#### Option A: Censorship-resistant tunnel (recommended if front is in Russia)
+
+Standard VPN protocols (WireGuard, OpenVPN) are detectable and blocked on many
+Russian ISPs.  Use a DPI-resistant tunnel instead:
+
+- **[Shadowsocks](https://shadowsocks.org/)** — widely used, low overhead
+- **[VLESS/XRay](https://github.com/XTLS/Xray-core)** — highly configurable, very hard to block
+- **[Hysteria2](https://github.com/apernet/hysteria)** — QUIC-based, good for lossy links
+
+Set up the tunnel between front and back servers and use the **tunnel interface
+addresses** in the node names (`front@10.8.0.1`, `back@10.8.0.2`).  No extra
+Erlang config is needed once the tunnel is up.
+
+> If the front server is **not** in a heavily censored region, WireGuard or
+> IPsec work equally well and are simpler to set up.
+
+#### Option B: TLS distribution (no tunnel required)
+
+If you prefer not to run a separate tunnel, you can secure the distribution link
+with mutual-TLS certificates.  Run on the **back server**:
+
+```bash
+# Step 1 — on the back server: initialise CA and generate back cert
+./scripts/gen_dist_certs.sh init /etc/mtproto-proxy/dist
+
+# Step 2 — repeat for each front server you add
+./scripts/gen_dist_certs.sh add-node /etc/mtproto-proxy/dist front
+# (use a distinct name per front, e.g. front1, front2, …)
+
+# Copy to each server (paths already substituted — no editing needed):
+#   back server:  ca.pem  back.pem  back.key
+#                 ssl_dist.back.conf  → deploy as ssl_dist.conf
+#   front server: ca.pem  front.pem  front.key
+#                 ssl_dist.front.conf → deploy as ssl_dist.conf
+# Then uncomment -proto_dist and -ssl_dist_optfile in vm.args on each server.
+```
+
+Reference: [Erlang TLS distribution docs](https://www.erlang.org/doc/apps/ssl/ssl_distribution.html)
+
+### Step 2 — configure the back server
+
+Copy `config/sys.config.back.example` to `config/prod-sys.config` and
+`config/vm.args.back.example` to `config/prod-vm.args` on the back server.
+Edit them:
+
+- In `vm.args`: set the **back** server's IP: `-name back@<BACK_IP>` and choose
+  a strong cookie string (`-setcookie ...`).
+- In `sys.config`: set `external_ip` to the back server's public IP, or leave
+  `ip_lookup_services` to auto-detect it.
+- If using TLS distribution (Option B): uncomment the `-proto_dist` /
+  `-ssl_dist_optfile` lines in `vm.args`.
+
+### Step 3 — configure the front server
+
+Copy `config/sys.config.front.example` and `config/vm.args.front.example` to
+the front server.  Edit them:
+
+- In `vm.args`: set the **front** server's IP: `-name front@<FRONT_IP>` and the
+  **same** cookie string as the back.
+- In `sys.config`: set `back_node` to the back node name you chose above
+  (e.g. `'back@10.8.0.2'`), configure `ports` / `secret` / `tag` as usual.
+- If using TLS distribution: uncomment `-proto_dist` / `-ssl_dist_optfile` here too.
+
+### Step 4 — start in order
+
+Always **start the back server first**.  The front server connects to it on
+startup; if the back is not yet up the front will log a warning and retry
+automatically on the next client connection.
+
+```bash
+# On back server:
+make && systemctl start mtproto-proxy
+
+# On front server (after back is up):
+make && systemctl start mtproto-proxy
+```
+
+### Step 5 — verify
+
+On the front server, check that the back node is visible:
+
+```bash
+/opt/personal_mtproxy/bin/mtproto_proxy remote_console
+# In the Erlang shell:
+nodes().          % should list the back node
+```
+
+On the back server, verify DC pools are running:
+
+```bash
+/opt/personal_mtproxy/bin/mtproto_proxy remote_console
+# In the Erlang shell:
+mtp_config:status().
+```
+
+### Firewall rules
+
+| Server | Port                  | Allow from    |
+|--------|-----------------------|---------------|
+| back   | 4369 (EPMD)           | front IP only |
+| back   | 9199 (dist)           | front IP only |
+| front  | 4369 (EPMD)           | back IP only  |
+| front  | 9199 (dist)           | back IP only  |
+| front  | 443 / your proxy port | anywhere      |
+
+If you used a fixed dist port in `vm.args` (`inet_dist_listen_min/max 9199`),
+only port 9199 needs to be open; otherwise allow the full 9199–9254 range plus
+EPMD (4369).  **Never expose the distribution port to the public internet.**
